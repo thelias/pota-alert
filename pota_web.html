@@ -205,6 +205,7 @@ function App() {
   const [notifState, setNotifState] = useState(
     typeof Notification !== "undefined" ? Notification.permission : "unsupported"
   );
+  const [otherTabOpen, setOtherTabOpen] = useState(false);
 
   // --- refs to avoid stale closures in the poll loop --------------------
   const firstRunRef = useRef(Object.keys(bucket.map).length === 0);
@@ -284,6 +285,59 @@ function App() {
   useEffect(() => {
     const id = setInterval(() => setNowMs(Date.now()), 15000);
     return () => clearInterval(id);
+  }, []);
+
+  // --- other-tab detection ---------------------------------------------
+  // BroadcastChannel lets same-origin tabs hear each other. We heartbeat
+  // every 5s and prune peers we haven't heard from in 10s, so a closed
+  // tab (even one that crashed without firing beforeunload) clears out.
+  useEffect(() => {
+    if (typeof BroadcastChannel === "undefined") return;
+    const ch = new BroadcastChannel("pota-alert-presence");
+    const myId = Math.random().toString(36).slice(2);
+    const peers = new Map(); // id -> lastSeen ms
+
+    const refresh = () => {
+      const cutoff = Date.now() - 10000;
+      for (const [id, t] of peers) if (t < cutoff) peers.delete(id);
+      setOtherTabOpen(peers.size > 0);
+    };
+
+    ch.onmessage = (e) => {
+      const { type, id } = e.data || {};
+      if (!id || id === myId) return;
+      if (type === "ping") {
+        peers.set(id, Date.now());
+        ch.postMessage({ type: "pong", id: myId });
+        refresh();
+      } else if (type === "pong") {
+        peers.set(id, Date.now());
+        refresh();
+      } else if (type === "bye") {
+        peers.delete(id);
+        refresh();
+      }
+    };
+
+    const ping = () => {
+      try { ch.postMessage({ type: "ping", id: myId }); } catch {}
+    };
+    ping();
+    const hbId = setInterval(() => { ping(); refresh(); }, 5000);
+
+    const bye = () => {
+      try { ch.postMessage({ type: "bye", id: myId }); } catch {}
+    };
+    window.addEventListener("beforeunload", bye);
+    window.addEventListener("pagehide", bye);
+
+    return () => {
+      bye();
+      clearInterval(hbId);
+      window.removeEventListener("beforeunload", bye);
+      window.removeEventListener("pagehide", bye);
+      ch.close();
+    };
   }, []);
 
   // --- poll loop -------------------------------------------------------
@@ -526,6 +580,17 @@ function App() {
             Watchlist{watchCount ? ` (${watchCount})` : ""}
           </button>
         </div>
+
+        {/* Other-tab banner */}
+        {otherTabOpen && (
+          <div className="px-6 py-2 text-xs bg-rose-600/20 border-t border-rose-600/50 flex items-center gap-3">
+            <span>
+              POTA Alert is already open in another tab. Running it in multiple
+              tabs causes duplicate notifications and races over the
+              "seen today" state — close the other tab(s).
+            </span>
+          </div>
+        )}
 
         {/* Notification banner */}
         {notifState === "default" || notifState === "denied" ? (
