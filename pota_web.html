@@ -713,8 +713,17 @@ function App() {
                       <span>{main}</span>
                       <span className="text-[10px] text-slate-500 align-baseline">{tail}</span>
                     </td>
-                    <td className="py-2 px-3 mono font-semibold truncate" title={row.activator}>
-                      {row.activator}
+                    <td className="py-2 px-3">
+                      <a
+                        href={`https://www.qrz.com/db/${encodeURIComponent(row.activator)}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        onClick={(e) => e.stopPropagation()}
+                        title={`QRZ lookup for ${row.activator}`}
+                        className="mono font-semibold inline-block px-1.5 py-0.5 rounded border border-slate-700 bg-slate-800 hover:bg-slate-700 hover:border-sky-500 text-sky-200 hover:text-sky-100"
+                      >
+                        {row.activator}
+                      </a>
                     </td>
                     <td className="py-2 px-3 text-slate-300 truncate" title={row.locationDesc || ""}>
                       {row.locationDesc || "—"}
