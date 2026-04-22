@@ -428,6 +428,15 @@ function App() {
     if (n) log(`Marked ${n} activator(s) as seen.`);
   };
 
+  const markRowSeen = (cs) => {
+    const row = activatorsRef.current[cs];
+    if (!row || !row.is_new) return;
+    const next = { ...activatorsRef.current, [cs]: { ...row, is_new: false } };
+    setActivators(next);
+    activatorsRef.current = next;
+    log(`Marked ${cs} as seen.`);
+  };
+
   const checkNow = () => {
     log("Manual check triggered.");
     poll();
@@ -624,8 +633,10 @@ function App() {
                 out.push(
                   <tr
                     key={row.activator}
+                    onClick={() => markRowSeen(row.activator)}
+                    title={row.is_new ? "Click to mark as seen" : undefined}
                     className={`border-b border-slate-800 hover:bg-slate-800/40 ${
-                      row.is_new ? "row-new" : ""
+                      row.is_new ? "row-new cursor-pointer" : ""
                     }`}
                   >
                     <td className="py-2 px-3 whitespace-nowrap">
