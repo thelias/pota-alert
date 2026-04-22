@@ -81,13 +81,6 @@ The web UI has a built-in editor under the **Watchlist** button that
 writes straight to `watchlist.txt` — so you can edit it from the UI or
 from your text editor, whichever you prefer.
 
-## Frequency & band display
-
-Frequencies render in standard ham dial notation `MHz.kHz.Hz` — the POTA
-feed's `14057.5` kHz shows as `14.057.500`, with the trailing Hz group in
-a smaller font. Rows are sorted by frequency ascending and grouped under
-band headers (160m, 80m, 40m, 30m, 20m, 17m, 15m, 12m, 10m, 6m, 2m, 70cm,
-…), matching the layout of the main POTA spotter pages.
 
 ## Notes
 
@@ -96,6 +89,3 @@ band headers (160m, 80m, 40m, 30m, 20m, 17m, 15m, 12m, 10m, 6m, 2m, 70cm,
 - On a cold start, the current feed is seeded silently so you don't get a
   burst of dozens of notifications at launch.
 
-## License
-
-Add your own before publishing (e.g. MIT).
