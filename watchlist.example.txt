@@ -1,0 +1,9 @@
+# POTA Alert watchlist — one callsign per line.
+# Lines starting with # are ignored. Matching is case-insensitive.
+#
+# A base call like  F5MQU   matches F5MQU, F5MQU/P, F5MQU/M, ...
+# A specific form   F5MQU/P matches only that exact variant.
+#
+# Examples (uncomment to activate):
+#   W1AW
+#   K4ABC/P

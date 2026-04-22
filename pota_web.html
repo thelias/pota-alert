@@ -1,0 +1,690 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>POTA Alert</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  html, body { height: 100%; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text",
+                 "Segoe UI", Roboto, sans-serif;
+  }
+  .mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  }
+  /* Pulse the 🆕 pill on new rows */
+  @keyframes pulse-new {
+    0%, 100% { background-color: rgba(251, 191, 36, 0.25); }
+    50%      { background-color: rgba(251, 191, 36, 0.45); }
+  }
+  .row-new { animation: pulse-new 2s ease-in-out infinite; }
+</style>
+</head>
+<body class="bg-slate-900 text-slate-100 m-0">
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useMemo, useCallback } = React;
+
+// --- Helpers (mirror the Python logic) -----------------------------------
+
+const QRT_RE = /\bqrt\b/i;
+
+function isQrt(spot) {
+  return QRT_RE.test(spot.comments || "");
+}
+
+function callsignForms(cs) {
+  cs = (cs || "").trim().toUpperCase();
+  const forms = new Set([cs]);
+  if (cs.includes("/")) forms.add(cs.split("/")[0]);
+  return forms;
+}
+
+function isOnWatchlist(cs, watchlist) {
+  for (const form of callsignForms(cs)) {
+    if (watchlist.has(form)) return true;
+  }
+  return false;
+}
+
+function parseWatchlist(text) {
+  const set = new Set();
+  for (const raw of (text || "").split("\n")) {
+    const line = raw.split("#")[0].trim().toUpperCase();
+    if (line) set.add(line);
+  }
+  return set;
+}
+
+function frequencyKey(row) {
+  const f = parseFloat(row.frequency);
+  return isNaN(f) ? 0 : f;
+}
+
+// POTA returns frequency as a kHz string ("14057.0"). Split into the main
+// MHz.kHz portion ("14.057") and a smaller Hz tail (".000") so rows read
+// like ham-radio dial notation.
+function formatFreq(raw) {
+  if (raw == null || raw === "") return { main: "—", tail: "" };
+  const kHz = parseFloat(raw);
+  if (isNaN(kHz)) return { main: String(raw), tail: "" };
+  const mhz = Math.floor(kHz / 1000);
+  const kRem = kHz - mhz * 1000;
+  const kInt = Math.floor(kRem);
+  const hz = Math.round((kRem - kInt) * 1000);
+  return {
+    main: `${mhz}.${String(kInt).padStart(3, "0")}`,
+    tail: `.${String(hz).padStart(3, "0")}`,
+  };
+}
+
+// Standard ham bands, in kHz. Sorted low → high; rows sorted by frequency
+// ascending will naturally fall into these groups in order.
+const BANDS = [
+  { name: "160m",  lo:   1800, hi:   2000 },
+  { name: "80m",   lo:   3500, hi:   4000 },
+  { name: "60m",   lo:   5330, hi:   5410 },
+  { name: "40m",   lo:   7000, hi:   7300 },
+  { name: "30m",   lo:  10100, hi:  10150 },
+  { name: "20m",   lo:  14000, hi:  14350 },
+  { name: "17m",   lo:  18068, hi:  18168 },
+  { name: "15m",   lo:  21000, hi:  21450 },
+  { name: "12m",   lo:  24890, hi:  24990 },
+  { name: "10m",   lo:  28000, hi:  29700 },
+  { name: "6m",    lo:  50000, hi:  54000 },
+  { name: "2m",    lo: 144000, hi: 148000 },
+  { name: "1.25m", lo: 222000, hi: 225000 },
+  { name: "70cm",  lo: 420000, hi: 450000 },
+  { name: "33cm",  lo: 902000, hi: 928000 },
+  { name: "23cm",  lo:1240000, hi:1300000 },
+];
+
+function bandOf(raw) {
+  const kHz = parseFloat(raw);
+  if (isNaN(kHz)) return "—";
+  for (const b of BANDS) {
+    if (kHz >= b.lo && kHz <= b.hi) return b.name;
+  }
+  return "other";
+}
+
+function formatElapsed(spotTime, nowMs) {
+  if (!spotTime) return "?";
+  // POTA returns naive UTC like "2026-04-22T15:30:00". Treat as UTC.
+  const t = Date.parse(spotTime + (spotTime.endsWith("Z") ? "" : "Z"));
+  if (isNaN(t)) return "?";
+  const secs = Math.floor((nowMs - t) / 1000);
+  if (secs < 0) return "now";
+  if (secs < 60) return `${secs}s`;
+  if (secs < 3600) return `${Math.floor(secs / 60)}m`;
+  const hrs = Math.floor(secs / 3600);
+  const rem = Math.floor((secs % 3600) / 60);
+  return `${hrs}h${rem}m`;
+}
+
+function todayUtc() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+// --- LocalStorage wrappers ------------------------------------------------
+
+const LS_SEEN = "pota-seen-v1";      // { date: "YYYY-MM-DD", map: { CS: ref } }
+const LS_FILTER = "pota-filter";
+const LS_WATCHLIST = "pota-watchlist"; // cached copy of watchlist.txt
+
+function loadSeenBucket() {
+  try {
+    const v = JSON.parse(localStorage.getItem(LS_SEEN) || "{}");
+    if (v && typeof v === "object" && v.date && v.map) return v;
+  } catch {}
+  return { date: todayUtc(), map: {} };
+}
+
+function saveSeenBucket(bucket) {
+  try {
+    localStorage.setItem(LS_SEEN, JSON.stringify(bucket));
+  } catch {}
+}
+
+// --- Notification helpers -------------------------------------------------
+
+function sendNotification(title, body) {
+  if (typeof Notification === "undefined") return;
+  if (Notification.permission !== "granted") return;
+  try {
+    const n = new Notification(title, { body, tag: title });
+    setTimeout(() => { try { n.close(); } catch {} }, 15000);
+  } catch {}
+}
+
+// --- Components -----------------------------------------------------------
+
+function Pill({ children, color = "slate" }) {
+  const colors = {
+    slate:  "bg-slate-700 text-slate-200",
+    amber:  "bg-amber-500/30 text-amber-200 border border-amber-500/60",
+    yellow: "bg-yellow-500/30 text-yellow-200 border border-yellow-500/60",
+    green:  "bg-emerald-500/30 text-emerald-200 border border-emerald-500/60",
+    red:    "bg-rose-500/30 text-rose-200 border border-rose-500/60",
+    blue:   "bg-sky-500/30 text-sky-200 border border-sky-500/60",
+  };
+  return (
+    <span className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-semibold ${colors[color] || colors.slate}`}>
+      {children}
+    </span>
+  );
+}
+
+function App() {
+  // --- persistent / initial state --------------------------------------
+  const initialBucket = loadSeenBucket();
+  // If the stored bucket is from a previous UTC day, wipe.
+  const bucket =
+    initialBucket.date === todayUtc() ? initialBucket : { date: todayUtc(), map: {} };
+
+  const [activators, setActivators] = useState({});
+  const [seenMap, setSeenMap] = useState(bucket.map);
+  const [utcDate, setUtcDate] = useState(bucket.date);
+  const [watchlistText, setWatchlistText] = useState(
+    () => localStorage.getItem(LS_WATCHLIST) || ""
+  );
+  const [filter, setFilter] = useState(() => localStorage.getItem(LS_FILTER) || "");
+  const [paused, setPaused] = useState(false);
+  const [showWatchlist, setShowWatchlist] = useState(false);
+  const [showLogs, setShowLogs] = useState(false);
+  const [status, setStatus] = useState("Starting…");
+  const [lastPoll, setLastPoll] = useState(null);
+  const [logs, setLogs] = useState([]);
+  const [nowMs, setNowMs] = useState(Date.now());
+  const [notifState, setNotifState] = useState(
+    typeof Notification !== "undefined" ? Notification.permission : "unsupported"
+  );
+
+  // --- refs to avoid stale closures in the poll loop --------------------
+  const firstRunRef = useRef(Object.keys(bucket.map).length === 0);
+  const activatorsRef = useRef(activators);
+  const seenRef = useRef(seenMap);
+  const pausedRef = useRef(paused);
+  const filterRef = useRef(filter);
+  const utcDateRef = useRef(utcDate);
+  const watchlistRef = useRef(parseWatchlist(watchlistText));
+
+  activatorsRef.current = activators;
+  seenRef.current = seenMap;
+  pausedRef.current = paused;
+  filterRef.current = filter;
+  utcDateRef.current = utcDate;
+
+  // Keep the derived watchlist set fresh.
+  useEffect(() => {
+    watchlistRef.current = parseWatchlist(watchlistText);
+    try { localStorage.setItem(LS_WATCHLIST, watchlistText); } catch {}
+  }, [watchlistText]);
+
+  useEffect(() => {
+    try { localStorage.setItem(LS_FILTER, filter); } catch {}
+  }, [filter]);
+
+  useEffect(() => {
+    saveSeenBucket({ date: utcDate, map: seenMap });
+  }, [utcDate, seenMap]);
+
+  // --- watchlist initial load from server ------------------------------
+  useEffect(() => {
+    fetch("/api/watchlist")
+      .then(r => (r.ok ? r.text() : Promise.reject(r.statusText)))
+      .then(text => { if (text !== watchlistText) setWatchlistText(text); })
+      .catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const saveWatchlist = useCallback(async (text) => {
+    try {
+      await fetch("/api/watchlist", {
+        method: "PUT",
+        headers: { "Content-Type": "text/plain" },
+        body: text,
+      });
+    } catch {}
+  }, []);
+
+  // --- logging ---------------------------------------------------------
+  const log = useCallback((msg) => {
+    const stamp = new Date().toLocaleTimeString();
+    setLogs((prev) => {
+      const next = prev.concat(`[${stamp}] ${msg}`);
+      if (next.length > 500) next.splice(0, next.length - 500);
+      return next;
+    });
+    // Also mirror to console for dev.
+    console.log(`[${stamp}] ${msg}`);
+  }, []);
+
+  // --- notifications ---------------------------------------------------
+  const requestNotifPermission = useCallback(async () => {
+    if (typeof Notification === "undefined") return;
+    const p = await Notification.requestPermission();
+    setNotifState(p);
+  }, []);
+
+  useEffect(() => {
+    // Try a quiet auto-request on load; browsers will ignore if already decided.
+    if (typeof Notification !== "undefined" && Notification.permission === "default") {
+      Notification.requestPermission().then(setNotifState).catch(() => {});
+    }
+  }, []);
+
+  // --- elapsed ticker --------------------------------------------------
+  useEffect(() => {
+    const id = setInterval(() => setNowMs(Date.now()), 15000);
+    return () => clearInterval(id);
+  }, []);
+
+  // --- poll loop -------------------------------------------------------
+  const poll = useCallback(async () => {
+    // UTC rollover.
+    const today = todayUtc();
+    if (utcDateRef.current !== today) {
+      log(`UTC day rolled over → ${today}. Reseeding.`);
+      utcDateRef.current = today;
+      setUtcDate(today);
+      seenRef.current = {};
+      setSeenMap({});
+      setActivators({});
+      activatorsRef.current = {};
+      firstRunRef.current = true;
+    }
+
+    let spots;
+    try {
+      const resp = await fetch("/api/spots", { cache: "no-store" });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      spots = await resp.json();
+    } catch (e) {
+      setStatus(`Fetch failed: ${e.message}`);
+      log(`Fetch failed: ${e.message}`);
+      return;
+    }
+    const stamp = new Date();
+    setLastPoll(stamp);
+    setStatus(`Updated ${stamp.toLocaleTimeString()}`);
+
+    // Mode filter.
+    let filtered = spots;
+    if (filterRef.current) {
+      const wanted = filterRef.current.toUpperCase();
+      filtered = spots.filter((s) => (s.mode || "").toUpperCase() === wanted);
+    }
+
+    // Collapse to the latest spot per callsign.
+    const latest = new Map();
+    for (const s of filtered) {
+      const cs = s.activator;
+      if (!cs) continue;
+      const prev = latest.get(cs);
+      if (!prev || (s.spotTime || "") > (prev.spotTime || "")) {
+        latest.set(cs, s);
+      }
+    }
+
+    const wl = watchlistRef.current;
+    const prevActivators = activatorsRef.current;
+    const prevSeen = { ...seenRef.current };
+    const nextActivators = {};
+
+    if (firstRunRef.current) {
+      for (const [cs, spot] of latest) {
+        if (isQrt(spot)) continue;
+        nextActivators[cs] = {
+          ...spot,
+          is_new: false,
+          on_watch: isOnWatchlist(cs, wl),
+        };
+        prevSeen[cs] = (spot.reference || "").trim();
+      }
+      firstRunRef.current = false;
+      log(`Seeded ${Object.keys(prevSeen).length} activators (no alerts).`);
+    } else {
+      for (const [cs, spot] of latest) {
+        if (isQrt(spot)) {
+          if (prevActivators[cs]) {
+            log(`QRT  ${cs}  ${spot.reference || ""}  comments="${spot.comments || ""}"`);
+          }
+          continue;
+        }
+
+        const curRef = (spot.reference || "").trim();
+        const prev = prevActivators[cs];
+        const onWatch = isOnWatchlist(cs, wl);
+
+        if (prev && (prev.reference || "").trim() === curRef) {
+          // Same park — refresh row on spotTime change, no alert.
+          if (spot.spotTime !== prev.spotTime) {
+            nextActivators[cs] = {
+              ...spot,
+              is_new: prev.is_new,
+              on_watch: onWatch,
+            };
+          } else {
+            nextActivators[cs] = prev;
+          }
+          continue;
+        }
+
+        const lastRef = prevSeen[cs];
+        const alreadyAtSamePark = cs in prevSeen && lastRef === curRef;
+        let isNew;
+        if (alreadyAtSamePark) {
+          isNew = false;
+        } else {
+          isNew = true;
+          const parkChange = cs in prevSeen && lastRef !== curRef;
+          prevSeen[cs] = curRef;
+          if (!pausedRef.current) {
+            const title = `New activator: ${cs}`;
+            const body =
+              `${spot.reference || ""}  ${spot.frequency || ""} ${spot.mode || "?"}` +
+              (spot.name ? `  —  ${spot.name}` : "");
+            sendNotification(title, body);
+          }
+          const tags =
+            (pausedRef.current ? "[PAUSED] " : "") + (onWatch ? "[WATCH] " : "");
+          const reason = parkChange ? "NEW-PARK" : "NEW";
+          log(
+            `${tags}${reason}  ${cs}  ${spot.reference || ""}  ${spot.frequency || ""} ${spot.mode || ""}`
+          );
+        }
+        nextActivators[cs] = { ...spot, is_new: isNew, on_watch: onWatch };
+      }
+    }
+
+    activatorsRef.current = nextActivators;
+    seenRef.current = prevSeen;
+    setActivators(nextActivators);
+    setSeenMap(prevSeen);
+  }, [log]);
+
+  useEffect(() => {
+    poll();
+    const id = setInterval(poll, 60000);
+    return () => clearInterval(id);
+  }, [poll]);
+
+  // --- actions ---------------------------------------------------------
+  const markAllSeen = () => {
+    const n = Object.values(activators).filter((r) => r.is_new).length;
+    const next = {};
+    for (const [cs, row] of Object.entries(activators)) {
+      next[cs] = { ...row, is_new: false };
+    }
+    setActivators(next);
+    activatorsRef.current = next;
+    if (n) log(`Marked ${n} activator(s) as seen.`);
+  };
+
+  const checkNow = () => {
+    log("Manual check triggered.");
+    poll();
+  };
+
+  const onWatchlistChange = (text) => {
+    setWatchlistText(text);
+    saveWatchlist(text);
+  };
+
+  // --- render ----------------------------------------------------------
+  const rows = useMemo(
+    () => Object.values(activators).sort((a, b) => frequencyKey(a) - frequencyKey(b)),
+    [activators]
+  );
+  const newCount = rows.filter((r) => r.is_new).length;
+  const seenCount = Object.keys(seenMap).length;
+  const watchCount = watchlistRef.current.size;
+
+  return (
+    <div className="min-h-screen flex flex-col">
+      {/* Header */}
+      <header className="sticky top-0 z-10 border-b border-slate-700 bg-slate-800/95 backdrop-blur">
+        <div className="px-6 py-3 flex flex-wrap items-center gap-3">
+          <div className="flex items-center gap-3 mr-auto">
+            <span className="text-2xl" title={paused ? "Paused" : "Running"}>📡</span>
+            <div>
+              <h1 className="text-lg font-bold leading-tight">POTA Alert</h1>
+              <p className="text-xs text-slate-400">
+                {status}
+                {filter ? ` · filter: ${filter}` : ""}
+                {paused ? " · paused" : ""}
+              </p>
+            </div>
+          </div>
+
+          <select
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+            className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-sm"
+            title="Mode filter"
+          >
+            <option value="">All modes</option>
+            <option value="CW">CW</option>
+            <option value="SSB">SSB</option>
+            <option value="USB">USB</option>
+            <option value="LSB">LSB</option>
+            <option value="FT8">FT8</option>
+            <option value="FT4">FT4</option>
+            <option value="DATA">DATA</option>
+          </select>
+
+          <button
+            onClick={() => setPaused((p) => !p)}
+            className={`px-3 py-1 rounded text-sm font-semibold border ${
+              paused
+                ? "bg-emerald-600/20 border-emerald-500 hover:bg-emerald-600/40"
+                : "bg-slate-700 border-slate-600 hover:bg-slate-600"
+            }`}
+          >
+            {paused ? "Resume" : "Pause"}
+          </button>
+
+          <button
+            onClick={markAllSeen}
+            disabled={!newCount}
+            className="px-3 py-1 rounded text-sm font-semibold bg-amber-600/20 border border-amber-500 hover:bg-amber-600/40 disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            Mark all seen{newCount ? ` (${newCount})` : ""}
+          </button>
+
+          <button
+            onClick={checkNow}
+            className="px-3 py-1 rounded text-sm font-semibold bg-slate-700 border border-slate-600 hover:bg-slate-600"
+          >
+            Check now
+          </button>
+
+          <button
+            onClick={() => setShowWatchlist((v) => !v)}
+            className={`px-3 py-1 rounded text-sm font-semibold border ${
+              showWatchlist
+                ? "bg-sky-600/30 border-sky-500"
+                : "bg-slate-700 border-slate-600 hover:bg-slate-600"
+            }`}
+          >
+            Watchlist{watchCount ? ` (${watchCount})` : ""}
+          </button>
+        </div>
+
+        {/* Notification banner */}
+        {notifState === "default" || notifState === "denied" ? (
+          <div className="px-6 py-2 text-xs bg-amber-600/20 border-t border-amber-600/50 flex items-center gap-3">
+            <span>
+              {notifState === "denied"
+                ? "Browser notifications are blocked — enable them in your browser's site settings for this page."
+                : "Enable browser notifications to get alerted when you're not looking at the tab."}
+            </span>
+            {notifState !== "denied" && (
+              <button
+                onClick={requestNotifPermission}
+                className="ml-auto px-2 py-0.5 rounded bg-amber-600 text-white font-semibold hover:bg-amber-500"
+              >
+                Enable notifications
+              </button>
+            )}
+          </div>
+        ) : null}
+      </header>
+
+      {/* Watchlist drawer */}
+      {showWatchlist && (
+        <section className="border-b border-slate-700 bg-slate-800/60 px-6 py-4">
+          <div className="flex items-baseline justify-between mb-2">
+            <h2 className="text-sm font-semibold">Watchlist</h2>
+            <span className="text-xs text-slate-400">
+              Shared with the terminal &amp; menu bar scripts as <span className="mono">watchlist.txt</span>.
+            </span>
+          </div>
+          <textarea
+            value={watchlistText}
+            onChange={(e) => onWatchlistChange(e.target.value)}
+            rows={8}
+            spellCheck={false}
+            className="mono w-full bg-slate-900 border border-slate-700 rounded p-2 text-sm text-slate-100 focus:outline-none focus:border-sky-500"
+            placeholder={"# One callsign per line. Lines starting with # are ignored.\n# Base call (F5MQU) matches all suffixes; F5MQU/P matches only that form.\n"}
+          />
+          <p className="text-xs text-slate-500 mt-1">
+            Saved automatically on every keystroke. {watchCount} active {watchCount === 1 ? "entry" : "entries"}.
+          </p>
+        </section>
+      )}
+
+      {/* Summary bar */}
+      <section className="px-6 py-2 text-xs text-slate-400 border-b border-slate-800 bg-slate-900">
+        Seen today: <span className="text-slate-200 font-semibold">{seenCount}</span>
+        {" · "}Active: <span className="text-slate-200 font-semibold">{rows.length}</span>
+        {" · "}New: <span className="text-slate-200 font-semibold">{newCount}</span>
+        {lastPoll && <>{" · "}Last poll <span className="text-slate-500">{lastPoll.toLocaleTimeString()}</span></>}
+      </section>
+
+      {/* Main list */}
+      <main className="flex-1 overflow-auto">
+        <table className="w-full text-sm table-fixed">
+          <colgroup>
+            <col className="w-20" />    {/* badges */}
+            <col className="w-32" />    {/* freq */}
+            <col className="w-28" />    {/* call */}
+            <col className="w-28" />    {/* location */}
+            <col className="w-32" />    {/* park */}
+            <col className="w-16" />    {/* mode */}
+            <col className="w-20" />    {/* elapsed */}
+            <col />                     {/* comments (fills remaining) */}
+          </colgroup>
+          <thead className="sticky top-0 bg-slate-900 border-b border-slate-700 text-xs uppercase text-slate-400 tracking-wide">
+            <tr>
+              <th className="py-2 px-3 text-left"></th>
+              <th className="py-2 px-3 text-right">Freq (MHz)</th>
+              <th className="py-2 px-3 text-left">Call</th>
+              <th className="py-2 px-3 text-left">Location</th>
+              <th className="py-2 px-3 text-left">Park</th>
+              <th className="py-2 px-3 text-left">Mode</th>
+              <th className="py-2 px-3 text-right">Elapsed</th>
+              <th className="py-2 px-3 text-left">Comments</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.length === 0 && (
+              <tr>
+                <td colSpan={8} className="py-12 text-center text-slate-500">
+                  No active activators{filter ? ` in mode ${filter}` : ""}.
+                </td>
+              </tr>
+            )}
+            {(() => {
+              const out = [];
+              let lastBand = null;
+              for (const row of rows) {
+                const band = bandOf(row.frequency);
+                if (band !== lastBand) {
+                  out.push(
+                    <tr key={`band-${band}`} className="bg-slate-800/80 border-y border-slate-700">
+                      <td
+                        colSpan={8}
+                        className="py-1 px-3 text-center text-xs font-bold uppercase tracking-[0.2em] text-slate-300"
+                      >
+                        {band}
+                      </td>
+                    </tr>
+                  );
+                  lastBand = band;
+                }
+                const { main, tail } = formatFreq(row.frequency);
+                out.push(
+                  <tr
+                    key={row.activator}
+                    className={`border-b border-slate-800 hover:bg-slate-800/40 ${
+                      row.is_new ? "row-new" : ""
+                    }`}
+                  >
+                    <td className="py-2 px-3 whitespace-nowrap">
+                      {row.is_new && <Pill color="amber">NEW</Pill>}
+                      {row.is_new && row.on_watch && " "}
+                      {row.on_watch && <Pill color="yellow">★</Pill>}
+                    </td>
+                    <td className="py-2 px-3 text-right mono tabular-nums whitespace-nowrap">
+                      <span>{main}</span>
+                      <span className="text-[10px] text-slate-500 align-baseline">{tail}</span>
+                    </td>
+                    <td className="py-2 px-3 mono font-semibold truncate" title={row.activator}>
+                      {row.activator}
+                    </td>
+                    <td className="py-2 px-3 text-slate-300 truncate" title={row.locationDesc || ""}>
+                      {row.locationDesc || "—"}
+                    </td>
+                    <td className="py-2 px-3 mono text-slate-300 truncate" title={row.reference || ""}>
+                      {row.reference || "—"}
+                    </td>
+                    <td className="py-2 px-3 truncate">{row.mode || "—"}</td>
+                    <td className="py-2 px-3 text-right text-slate-400 tabular-nums whitespace-nowrap">
+                      {formatElapsed(row.spotTime, nowMs)}
+                    </td>
+                    <td
+                      className="py-2 px-3 text-slate-400 truncate overflow-hidden whitespace-nowrap"
+                      title={row.comments || ""}
+                    >
+                      {row.comments || ""}
+                    </td>
+                  </tr>
+                );
+              }
+              return out;
+            })()}
+          </tbody>
+        </table>
+      </main>
+
+      {/* Logs drawer */}
+      <footer className="border-t border-slate-700 bg-slate-800/60">
+        <button
+          onClick={() => setShowLogs((v) => !v)}
+          className="w-full text-left px-6 py-1.5 text-xs text-slate-400 hover:bg-slate-700/40"
+        >
+          {showLogs ? "▾" : "▸"} Logs ({logs.length})
+        </button>
+        {showLogs && (
+          <pre className="mono text-[11px] text-slate-400 px-6 py-2 max-h-56 overflow-auto border-t border-slate-700/60 whitespace-pre-wrap">
+            {logs.length ? logs.slice(-200).join("\n") : "(no log entries yet)"}
+          </pre>
+        )}
+      </footer>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<App />);
+</script>
+</body>
+</html>
