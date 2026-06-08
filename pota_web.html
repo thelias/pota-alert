@@ -114,6 +114,67 @@ function bandOf(raw) {
   return "other";
 }
 
+// POTA "location" codes for the Activator tab's state picker.
+// (US only for now — add CA-XX, GB-XX, etc. as we expand.)
+const US_LOCATIONS = [
+  { code: "US-AL", name: "Alabama" },
+  { code: "US-AK", name: "Alaska" },
+  { code: "US-AZ", name: "Arizona" },
+  { code: "US-AR", name: "Arkansas" },
+  { code: "US-CA", name: "California" },
+  { code: "US-CO", name: "Colorado" },
+  { code: "US-CT", name: "Connecticut" },
+  { code: "US-DE", name: "Delaware" },
+  { code: "US-DC", name: "District of Columbia" },
+  { code: "US-FL", name: "Florida" },
+  { code: "US-GA", name: "Georgia" },
+  { code: "US-HI", name: "Hawaii" },
+  { code: "US-ID", name: "Idaho" },
+  { code: "US-IL", name: "Illinois" },
+  { code: "US-IN", name: "Indiana" },
+  { code: "US-IA", name: "Iowa" },
+  { code: "US-KS", name: "Kansas" },
+  { code: "US-KY", name: "Kentucky" },
+  { code: "US-LA", name: "Louisiana" },
+  { code: "US-ME", name: "Maine" },
+  { code: "US-MD", name: "Maryland" },
+  { code: "US-MA", name: "Massachusetts" },
+  { code: "US-MI", name: "Michigan" },
+  { code: "US-MN", name: "Minnesota" },
+  { code: "US-MS", name: "Mississippi" },
+  { code: "US-MO", name: "Missouri" },
+  { code: "US-MT", name: "Montana" },
+  { code: "US-NE", name: "Nebraska" },
+  { code: "US-NV", name: "Nevada" },
+  { code: "US-NH", name: "New Hampshire" },
+  { code: "US-NJ", name: "New Jersey" },
+  { code: "US-NM", name: "New Mexico" },
+  { code: "US-NY", name: "New York" },
+  { code: "US-NC", name: "North Carolina" },
+  { code: "US-ND", name: "North Dakota" },
+  { code: "US-OH", name: "Ohio" },
+  { code: "US-OK", name: "Oklahoma" },
+  { code: "US-OR", name: "Oregon" },
+  { code: "US-PA", name: "Pennsylvania" },
+  { code: "US-RI", name: "Rhode Island" },
+  { code: "US-SC", name: "South Carolina" },
+  { code: "US-SD", name: "South Dakota" },
+  { code: "US-TN", name: "Tennessee" },
+  { code: "US-TX", name: "Texas" },
+  { code: "US-UT", name: "Utah" },
+  { code: "US-VT", name: "Vermont" },
+  { code: "US-VA", name: "Virginia" },
+  { code: "US-WA", name: "Washington" },
+  { code: "US-WV", name: "West Virginia" },
+  { code: "US-WI", name: "Wisconsin" },
+  { code: "US-WY", name: "Wyoming" },
+  { code: "US-PR", name: "Puerto Rico" },
+  { code: "US-VI", name: "U.S. Virgin Islands" },
+  { code: "US-GU", name: "Guam" },
+  { code: "US-AS", name: "American Samoa" },
+  { code: "US-MP", name: "Northern Mariana Islands" },
+];
+
 function formatElapsed(spotTime, nowMs) {
   if (!spotTime) return "?";
   // POTA returns naive UTC like "2026-04-22T15:30:00". Treat as UTC.
@@ -181,6 +242,397 @@ function Pill({ children, color = "slate" }) {
   );
 }
 
+// --- Activator tab ----------------------------------------------------------
+//
+// Lists every POTA-eligible park in a chosen state. Will grow into a fuller
+// planning view; for now: state picker + searchable, sortable park list.
+
+// Base comparators — all ascending. Direction is applied separately so a
+// repeat header click just flips the sign.
+const PARK_SORTS = {
+  reference: (a, b) => (a.reference || "").localeCompare(b.reference || "", undefined, { numeric: true }),
+  name:      (a, b) => (a.name || "").localeCompare(b.name || ""),
+  grid:      (a, b) => (a.grid || "").localeCompare(b.grid || ""),
+  activations: (a, b) => (a.activations || 0) - (b.activations || 0),
+  distance:  (a, b) => (a._distance ?? Infinity) - (b._distance ?? Infinity),
+};
+
+// Direction we pick the first time you click each column — most-activated
+// first is what activators usually want, so activations defaults to desc.
+const PARK_SORT_DEFAULT_DIR = {
+  reference: "asc",
+  name: "asc",
+  grid: "asc",
+  activations: "desc",
+  distance: "asc",
+};
+
+// POTA park records expose latitude/longitude under a few names depending on
+// endpoint; normalize.
+function parkLatLon(p) {
+  const lat = parseFloat(p.latitude ?? p.lat);
+  const lon = parseFloat(p.longitude ?? p.lng ?? p.lon);
+  if (isNaN(lat) || isNaN(lon)) return null;
+  return [lat, lon];
+}
+
+// Great-circle distance in miles (Earth radius 3958.8 mi).
+function haversineMiles(lat1, lon1, lat2, lon2) {
+  const R = 3958.8;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+function ActivatorView() {
+  const [location, setLocation] = useState(
+    () => localStorage.getItem("pota-activator-loc") || ""
+  );
+  const [parks, setParks] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [search, setSearch] = useState("");
+  const [sortBy, setSortBy] = useState("reference");
+  const [sortDir, setSortDir] = useState("asc");
+
+  // QTH radius filter.
+  const [qthCall, setQthCall] = useState(
+    () => localStorage.getItem("pota-qth-call") || ""
+  );
+  const [radiusMi, setRadiusMi] = useState(
+    () => localStorage.getItem("pota-radius-mi") || ""
+  );
+  const [qth, setQth] = useState(null);          // { call, grid, lat, lon }
+  const [qthLoading, setQthLoading] = useState(false);
+  const [qthError, setQthError] = useState(null);
+
+  useEffect(() => {
+    try { localStorage.setItem("pota-qth-call", qthCall); } catch {}
+  }, [qthCall]);
+  useEffect(() => {
+    try { localStorage.setItem("pota-radius-mi", radiusMi); } catch {}
+  }, [radiusMi]);
+
+  const lookupCall = useCallback(async (raw) => {
+    const call = (raw || "").trim().toUpperCase();
+    if (!call) {
+      setQth(null);
+      setQthError(null);
+      return;
+    }
+    setQthLoading(true);
+    setQthError(null);
+    try {
+      const r = await fetch(`/api/callsign?call=${encodeURIComponent(call)}`, {
+        cache: "force-cache",
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const data = await r.json();
+      if (data.status !== "VALID") {
+        throw new Error(
+          data.status === "INVALID"
+            ? "Not found (callook is US-only)"
+            : data.status || "Lookup failed"
+        );
+      }
+      const lat = parseFloat(data?.location?.latitude);
+      const lon = parseFloat(data?.location?.longitude);
+      if (isNaN(lat) || isNaN(lon)) throw new Error("No location data");
+      setQth({
+        call: data?.current?.callsign || call,
+        grid: data?.location?.gridsquare || "",
+        lat,
+        lon,
+      });
+    } catch (e) {
+      setQth(null);
+      setQthError(e.message || String(e));
+    } finally {
+      setQthLoading(false);
+    }
+  }, []);
+
+  // Look up a saved callsign on first mount.
+  useEffect(() => {
+    if (qthCall) lookupCall(qthCall);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const handleSort = (id) => {
+    if (sortBy === id) {
+      setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+    } else {
+      setSortBy(id);
+      setSortDir(PARK_SORT_DEFAULT_DIR[id] || "asc");
+    }
+  };
+
+  useEffect(() => {
+    if (!location) {
+      setParks([]);
+      return;
+    }
+    try { localStorage.setItem("pota-activator-loc", location); } catch {}
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    fetch(`/api/parks?location=${encodeURIComponent(location)}`, { cache: "no-store" })
+      .then((r) =>
+        r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))
+      )
+      .then((data) => {
+        if (cancelled) return;
+        const arr = Array.isArray(data)
+          ? data
+          : Array.isArray(data?.parks)
+            ? data.parks
+            : [];
+        setParks(arr);
+        setLoading(false);
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setError(e.message || String(e));
+        setParks([]);
+        setLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [location]);
+
+  // Parse radius once.
+  const radiusNum = useMemo(() => {
+    const r = parseFloat(radiusMi);
+    return isNaN(r) || r <= 0 ? null : r;
+  }, [radiusMi]);
+
+  const qthActive = !!(qth && radiusNum);
+
+  // Apply QTH radius filter first; attach _distance so we can sort/show it.
+  const filteredByQth = useMemo(() => {
+    if (!qthActive) return parks;
+    const out = [];
+    for (const p of parks) {
+      const ll = parkLatLon(p);
+      if (!ll) continue;
+      const d = haversineMiles(qth.lat, qth.lon, ll[0], ll[1]);
+      if (d <= radiusNum) out.push({ ...p, _distance: d });
+    }
+    return out;
+  }, [parks, qth, radiusNum, qthActive]);
+
+  const filtered = useMemo(() => {
+    if (!search.trim()) return filteredByQth;
+    const q = search.trim().toLowerCase();
+    return filteredByQth.filter(
+      (p) =>
+        (p.reference || "").toLowerCase().includes(q) ||
+        (p.name || "").toLowerCase().includes(q) ||
+        (p.grid || "").toLowerCase().includes(q)
+    );
+  }, [filteredByQth, search]);
+
+  const sorted = useMemo(() => {
+    const cmp = PARK_SORTS[sortBy] || PARK_SORTS.reference;
+    const sign = sortDir === "desc" ? -1 : 1;
+    return [...filtered].sort((a, b) => sign * cmp(a, b));
+  }, [filtered, sortBy, sortDir]);
+
+  const locName = (US_LOCATIONS.find((l) => l.code === location) || {}).name;
+
+  function SortHeader({ id, align, children }) {
+    const active = sortBy === id;
+    return (
+      <th
+        className={`py-2 px-3 ${align === "right" ? "text-right" : "text-left"} cursor-pointer select-none hover:text-slate-200`}
+        onClick={() => handleSort(id)}
+        title={active ? `Sorted ${sortDir}ending — click to flip` : "Click to sort"}
+      >
+        {children}
+        {active && (
+          <span className="ml-1 text-sky-400">
+            {sortDir === "desc" ? "↓" : "↑"}
+          </span>
+        )}
+      </th>
+    );
+  }
+
+  return (
+    <>
+      {/* Controls */}
+      <section className="border-b border-slate-800 bg-slate-900 px-6 py-3 space-y-2">
+        {/* Row 1: state + free-text search + count */}
+        <div className="flex flex-wrap items-center gap-3">
+          <label className="text-sm font-semibold text-slate-300">State</label>
+          <select
+            value={location}
+            onChange={(e) => setLocation(e.target.value)}
+            className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-sm min-w-[220px]"
+          >
+            <option value="">Select a state…</option>
+            {US_LOCATIONS.map((l) => (
+              <option key={l.code} value={l.code}>{l.code} — {l.name}</option>
+            ))}
+          </select>
+
+          <input
+            type="search"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Search by reference, name, or grid…"
+            className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-sm flex-1 min-w-[220px] max-w-md"
+            disabled={!location || (parks.length === 0 && !loading)}
+          />
+
+          <span className="text-xs text-slate-400 ml-auto">
+            {!location
+              ? "Pick a state to load parks."
+              : loading
+                ? "Loading…"
+                : error
+                  ? <span className="text-rose-400">Error: {error}</span>
+                  : (() => {
+                      const showOf = search.trim() || qthActive;
+                      const denom = qthActive ? filteredByQth.length : parks.length;
+                      return `${sorted.length}${showOf ? ` of ${denom}` : ""} parks${locName ? ` in ${locName}` : ""}`;
+                    })()}
+          </span>
+        </div>
+
+        {/* Row 2: QTH radius filter */}
+        <div className="flex flex-wrap items-center gap-3 text-sm">
+          <label className="font-semibold text-slate-300" htmlFor="qth-call">Near</label>
+          <input
+            id="qth-call"
+            type="text"
+            value={qthCall}
+            onChange={(e) => setQthCall(e.target.value)}
+            onBlur={() => lookupCall(qthCall)}
+            onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); lookupCall(qthCall); } }}
+            placeholder="callsign (e.g. W1AW)"
+            spellCheck={false}
+            autoCapitalize="characters"
+            className="mono bg-slate-900 border border-slate-700 rounded px-2 py-1 w-40 uppercase"
+          />
+          <label className="font-semibold text-slate-300" htmlFor="qth-radius">within</label>
+          <input
+            id="qth-radius"
+            type="number"
+            min="1"
+            step="1"
+            inputMode="numeric"
+            value={radiusMi}
+            onChange={(e) => setRadiusMi(e.target.value)}
+            placeholder="50"
+            className="bg-slate-900 border border-slate-700 rounded px-2 py-1 w-20 tabular-nums"
+          />
+          <span className="text-slate-400">miles</span>
+
+          <span className="text-xs ml-auto">
+            {qthLoading ? (
+              <span className="text-slate-400">Looking up…</span>
+            ) : qthError ? (
+              <span className="text-rose-400">⚠ {qthError}</span>
+            ) : qth ? (
+              <span className="text-emerald-300">
+                {qth.call}
+                {qth.grid && <span className="text-slate-400"> · {qth.grid}</span>}
+                <span className="text-slate-500"> · {qth.lat.toFixed(2)}, {qth.lon.toFixed(2)}</span>
+              </span>
+            ) : (
+              <span className="text-slate-500">Optional — filter parks within N miles of a QTH.</span>
+            )}
+          </span>
+        </div>
+      </section>
+
+      <main className="flex-1 overflow-auto">
+        {!location ? (
+          <div className="py-16 text-center text-slate-500">
+            Pick a state above to load every POTA-eligible park.
+          </div>
+        ) : loading ? (
+          <div className="py-16 text-center text-slate-500">Loading parks…</div>
+        ) : error ? (
+          <div className="py-16 text-center text-rose-400">
+            Couldn’t load parks: {error}
+            <div className="mt-2 text-xs text-slate-500">
+              If this keeps happening the upstream POTA endpoint may have moved.
+              Update <span className="mono">POTA_PARKS_API</span> in <span className="mono">pota_web.py</span>.
+            </div>
+          </div>
+        ) : (
+          <table className="w-full text-sm table-fixed">
+            <colgroup>
+              <col className="w-32" />   {/* reference */}
+              <col />                     {/* name (fills) */}
+              <col className="w-20" />   {/* grid */}
+              {qthActive && <col className="w-24" />} {/* distance */}
+              <col className="w-28" />   {/* activations */}
+            </colgroup>
+            <thead className="sticky top-0 bg-slate-900 border-b border-slate-700 text-xs uppercase text-slate-400 tracking-wide">
+              <tr>
+                <SortHeader id="reference">Reference</SortHeader>
+                <SortHeader id="name">Name</SortHeader>
+                <SortHeader id="grid">Grid</SortHeader>
+                {qthActive && <SortHeader id="distance" align="right">Distance</SortHeader>}
+                <SortHeader id="activations" align="right">Activations</SortHeader>
+              </tr>
+            </thead>
+            <tbody>
+              {sorted.length === 0 && (
+                <tr>
+                  <td colSpan={qthActive ? 5 : 4} className="py-12 text-center text-slate-500">
+                    {search
+                      ? "No matches."
+                      : qthActive
+                        ? `No parks within ${radiusNum} mi of ${qth.call}.`
+                        : "No parks returned for this state."}
+                  </td>
+                </tr>
+              )}
+              {sorted.map((p) => (
+                <tr
+                  key={p.reference}
+                  className="border-b border-slate-800 hover:bg-slate-800/40"
+                >
+                  <td className="py-2 px-3 mono font-semibold whitespace-nowrap">
+                    <a
+                      href={`https://pota.app/#/park/${encodeURIComponent(p.reference || "")}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-sky-200 hover:text-sky-100 hover:underline"
+                      title={`Open ${p.reference} on pota.app`}
+                    >
+                      {p.reference || "—"}
+                    </a>
+                  </td>
+                  <td className="py-2 px-3 truncate" title={p.name || ""}>
+                    {p.name || "—"}
+                  </td>
+                  <td className="py-2 px-3 mono text-slate-400">{p.grid || "—"}</td>
+                  {qthActive && (
+                    <td className="py-2 px-3 text-right text-slate-200 tabular-nums">
+                      {p._distance != null ? `${p._distance.toFixed(1)} mi` : "—"}
+                    </td>
+                  )}
+                  <td className="py-2 px-3 text-right text-slate-400 tabular-nums">
+                    {p.activations ?? "—"}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </main>
+    </>
+  );
+}
+
 function App() {
   // --- persistent / initial state --------------------------------------
   const initialBucket = loadSeenBucket();
@@ -198,6 +650,11 @@ function App() {
   const [paused, setPaused] = useState(false);
   const [showWatchlist, setShowWatchlist] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
+  const [tab, setTab] = useState(() => localStorage.getItem("pota-tab") || "hunter");
+
+  useEffect(() => {
+    try { localStorage.setItem("pota-tab", tab); } catch {}
+  }, [tab]);
   const [status, setStatus] = useState("Starting…");
   const [lastPoll, setLastPoll] = useState(null);
   const [logs, setLogs] = useState([]);
@@ -515,70 +972,99 @@ function App() {
       {/* Header */}
       <header className="sticky top-0 z-10 border-b border-slate-700 bg-slate-800/95 backdrop-blur">
         <div className="px-6 py-3 flex flex-wrap items-center gap-3">
-          <div className="flex items-center gap-3 mr-auto">
+          <div className="flex items-center gap-3">
             <span className="text-2xl" title={paused ? "Paused" : "Running"}>📡</span>
             <div>
               <h1 className="text-lg font-bold leading-tight">POTA Alert</h1>
               <p className="text-xs text-slate-400">
-                {status}
-                {filter ? ` · filter: ${filter}` : ""}
-                {paused ? " · paused" : ""}
+                {tab === "hunter" ? (
+                  <>
+                    {status}
+                    {filter ? ` · filter: ${filter}` : ""}
+                    {paused ? " · paused" : ""}
+                  </>
+                ) : (
+                  "Activator — park browser"
+                )}
               </p>
             </div>
           </div>
 
-          <select
-            value={filter}
-            onChange={(e) => setFilter(e.target.value)}
-            className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-sm"
-            title="Mode filter"
-          >
-            <option value="">All modes</option>
-            <option value="CW">CW</option>
-            <option value="SSB">SSB</option>
-            <option value="USB">USB</option>
-            <option value="LSB">LSB</option>
-            <option value="FT8">FT8</option>
-            <option value="FT4">FT4</option>
-            <option value="DATA">DATA</option>
-          </select>
+          {/* Tab nav */}
+          <nav className="flex items-center gap-1 ml-4 mr-auto" role="tablist">
+            {[["hunter", "Hunter"], ["activator", "Activator"]].map(([id, label]) => (
+              <button
+                key={id}
+                role="tab"
+                aria-selected={tab === id}
+                onClick={() => setTab(id)}
+                className={`px-3 py-1.5 rounded text-sm font-semibold transition-colors ${
+                  tab === id
+                    ? "bg-sky-600 text-white"
+                    : "text-slate-300 hover:bg-slate-700"
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </nav>
 
-          <button
-            onClick={() => setPaused((p) => !p)}
-            className={`px-3 py-1 rounded text-sm font-semibold border ${
-              paused
-                ? "bg-emerald-600/20 border-emerald-500 hover:bg-emerald-600/40"
-                : "bg-slate-700 border-slate-600 hover:bg-slate-600"
-            }`}
-          >
-            {paused ? "Resume" : "Pause"}
-          </button>
+          {tab === "hunter" && (
+            <>
+              <select
+                value={filter}
+                onChange={(e) => setFilter(e.target.value)}
+                className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-sm"
+                title="Mode filter"
+              >
+                <option value="">All modes</option>
+                <option value="CW">CW</option>
+                <option value="SSB">SSB</option>
+                <option value="USB">USB</option>
+                <option value="LSB">LSB</option>
+                <option value="FT8">FT8</option>
+                <option value="FT4">FT4</option>
+                <option value="DATA">DATA</option>
+              </select>
 
-          <button
-            onClick={markAllSeen}
-            disabled={!newCount}
-            className="px-3 py-1 rounded text-sm font-semibold bg-amber-600/20 border border-amber-500 hover:bg-amber-600/40 disabled:opacity-40 disabled:cursor-not-allowed"
-          >
-            Mark all seen{newCount ? ` (${newCount})` : ""}
-          </button>
+              <button
+                onClick={() => setPaused((p) => !p)}
+                className={`px-3 py-1 rounded text-sm font-semibold border ${
+                  paused
+                    ? "bg-emerald-600/20 border-emerald-500 hover:bg-emerald-600/40"
+                    : "bg-slate-700 border-slate-600 hover:bg-slate-600"
+                }`}
+              >
+                {paused ? "Resume" : "Pause"}
+              </button>
 
-          <button
-            onClick={checkNow}
-            className="px-3 py-1 rounded text-sm font-semibold bg-slate-700 border border-slate-600 hover:bg-slate-600"
-          >
-            Check now
-          </button>
+              <button
+                onClick={markAllSeen}
+                disabled={!newCount}
+                className="px-3 py-1 rounded text-sm font-semibold bg-amber-600/20 border border-amber-500 hover:bg-amber-600/40 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                Mark all seen{newCount ? ` (${newCount})` : ""}
+              </button>
 
-          <button
-            onClick={() => setShowWatchlist((v) => !v)}
-            className={`px-3 py-1 rounded text-sm font-semibold border ${
-              showWatchlist
-                ? "bg-sky-600/30 border-sky-500"
-                : "bg-slate-700 border-slate-600 hover:bg-slate-600"
-            }`}
-          >
-            Watchlist{watchCount ? ` (${watchCount})` : ""}
-          </button>
+              <button
+                onClick={checkNow}
+                className="px-3 py-1 rounded text-sm font-semibold bg-slate-700 border border-slate-600 hover:bg-slate-600"
+              >
+                Check now
+              </button>
+
+              <button
+                onClick={() => setShowWatchlist((v) => !v)}
+                className={`px-3 py-1 rounded text-sm font-semibold border ${
+                  showWatchlist
+                    ? "bg-sky-600/30 border-sky-500"
+                    : "bg-slate-700 border-slate-600 hover:bg-slate-600"
+                }`}
+              >
+                Watchlist{watchCount ? ` (${watchCount})` : ""}
+              </button>
+            </>
+          )}
         </div>
 
         {/* Other-tab banner */}
@@ -612,6 +1098,10 @@ function App() {
         ) : null}
       </header>
 
+      {tab === "activator" && <ActivatorView />}
+
+      {tab === "hunter" && (
+        <>
       {/* Watchlist drawer */}
       {showWatchlist && (
         <section className="border-b border-slate-700 bg-slate-800/60 px-6 py-4">
@@ -749,6 +1239,8 @@ function App() {
           </tbody>
         </table>
       </main>
+        </>
+      )}
 
       {/* Logs drawer */}
       <footer className="border-t border-slate-700 bg-slate-800/60">

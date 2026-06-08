@@ -19,16 +19,26 @@ browser's localStorage). Just leave the tab open.
 """
 
 import http.server
+import re
 import socketserver
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 import webbrowser
 from pathlib import Path
 
-PORT = 5656 
+PORT = 5656
 HERE = Path(__file__).resolve().parent
 POTA_API = "https://api.pota.app/spot/activator"
+# Parks-by-location endpoint used by the Activator tab. The pota.app website's
+# park browser hits this same path — if POTA ever moves it, edit this constant.
+POTA_PARKS_API = "https://api.pota.app/location/parks/{location}"
+LOCATION_RE = re.compile(r"^[A-Za-z]{2}-[A-Za-z0-9]{2,3}$")
+# Callook is free and unauth'd for US callsigns. International calls return
+# "INVALID" — fine for now, we surface that as an error.
+CALLOOK_API = "https://callook.info/{call}/json"
+CALLSIGN_RE = re.compile(r"^[A-Z0-9][A-Z0-9/]{1,11}$")
 HTML_FILE = HERE / "pota_web.html"
 WATCHLIST_PATH = HERE / "watchlist.txt"
 WATCHLIST_EXAMPLE = HERE / "watchlist.example.txt"
@@ -58,6 +68,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if self.path.startswith("/api/spots"):
             self._proxy_spots()
+        elif self.path.startswith("/api/parks"):
+            self._proxy_parks()
+        elif self.path.startswith("/api/callsign"):
+            self._proxy_callsign()
         elif self.path.startswith("/api/watchlist"):
             self._get_watchlist()
         elif self.path in ("/", ""):
@@ -99,6 +113,57 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _proxy_parks(self) -> None:
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        location = (qs.get("location") or [""])[0].strip().upper()
+        if not LOCATION_RE.match(location):
+            self.send_error(400, "location query must look like 'US-MA'")
+            return
+        url = POTA_PARKS_API.format(location=location)
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "pota-web/0.1"}
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                body = resp.read()
+        except (urllib.error.URLError, TimeoutError) as e:
+            self.send_error(502, f"Upstream error: {e}")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        # Parks lists are stable enough to cache for a few minutes; keeps state
+        # switches snappy and reduces hits on POTA.
+        self.send_header("Cache-Control", "public, max-age=300")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _proxy_callsign(self) -> None:
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        call = (qs.get("call") or [""])[0].strip().upper()
+        if not CALLSIGN_RE.match(call):
+            self.send_error(400, "invalid callsign")
+            return
+        url = CALLOOK_API.format(call=urllib.parse.quote(call, safe=""))
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "pota-web/0.1"}
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                body = resp.read()
+        except (urllib.error.URLError, TimeoutError) as e:
+            self.send_error(502, f"Upstream error: {e}")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        # FCC data doesn't move often; cache for an hour.
+        self.send_header("Cache-Control", "public, max-age=3600")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
